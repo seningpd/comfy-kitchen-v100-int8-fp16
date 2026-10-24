@@ -1,0 +1,545 @@
+diff --git a/comfy_kitchen/__init__.py b/comfy_kitchen/__init__.py
+index 6c2af58..0489a53 100644
+--- a/comfy_kitchen/__init__.py
++++ b/comfy_kitchen/__init__.py
+@@ -1120,6 +1120,64 @@ def int8_linear(
+     return impl(**kwargs)
+ 
+ 
++def int8_linear_fp16(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    out_dtype: torch.dtype | None = None,
++    convrot: bool = False,
++    convrot_groupsize: int = 256,
++    input_act: str | None = None,
++    input_act_weight: torch.Tensor | None = None,
++    input_act_eps: float = 0.0,
++    residual: torch.Tensor | None = None,
++    residual_scale: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """INT8 linear layer that runs the GEMM on the FP16 tensor cores.
++
++    The INT8 weights are dequantized to FP16 on the fly, so the memory
++    footprint matches the INT8 path. On devices without INT8 tensor cores
++    (Volta/sm_70) this is much faster than the DP4A-emulated INT8 GEMM.
++
++    Args:
++        x: Input tensor [..., K].
++        weight: INT8 weight tensor [N, K].
++        weight_scale: Scalar or per-output-channel weight scale.
++        bias: Optional bias [N].
++        out_dtype: Output dtype.
++        convrot: If True, apply online activation rotation.
++        convrot_groupsize: Group size for Hadamard rotation.
++        input_act: Optional activation folded in before quantization.
++        input_act_weight: K-element norm weight, required for "rms_norm".
++        input_act_eps: Norm eps for "rms_norm".
++        residual: Optional [..., N] tensor; the result becomes
++            ``residual + residual_scale * linear(x)``.
++        residual_scale: Per-channel [N] scale for the residual form.
++
++    Returns:
++        Result tensor [..., N].
++    """
++    if out_dtype is None:
++        out_dtype = torch.bfloat16
++    kwargs = {
++        "x": x,
++        "weight": weight,
++        "weight_scale": weight_scale,
++        "bias": bias,
++        "out_dtype": out_dtype,
++        "convrot": convrot,
++        "convrot_groupsize": convrot_groupsize,
++        "input_act": input_act,
++        "input_act_weight": input_act_weight,
++        "input_act_eps": input_act_eps,
++        "residual": residual,
++        "residual_scale": residual_scale,
++    }
++    impl = registry.get_implementation("int8_linear_fp16", kwargs=kwargs)
++    return impl(**kwargs)
++
++
+ def int8_linear_modulated(
+     x: torch.Tensor,
+     modulation_scale: torch.Tensor,
+diff --git a/comfy_kitchen/backends/eager/__init__.py b/comfy_kitchen/backends/eager/__init__.py
+index e7e6f7e..45516b1 100644
+--- a/comfy_kitchen/backends/eager/__init__.py
++++ b/comfy_kitchen/backends/eager/__init__.py
+@@ -55,6 +55,7 @@ __all__ = [
+     "stochastic_rounding_fp8",
+     "fp16_linear",
+     "int8_linear",
++    "int8_linear_fp16",
+     "int8_linear_modulated",
+     "int8_linear_rms_modulated",
+     "w4a8_int8_linear",
+@@ -96,6 +97,7 @@ from .quantization import (
+     dequantize_per_tensor_fp8,
+     fp16_linear,
+     int8_linear,
++    int8_linear_fp16,
+     int8_linear_modulated,
+     int8_linear_rms_modulated,
+     quantize_and_rotate_rowwise,
+@@ -589,6 +591,17 @@ def _build_constraints() -> dict:
+         },
+         default_devices=all_devices,
+     )
++    out["int8_linear_fp16"] = FunctionConstraints(
++        params={
++            "x": ParamConstraint(dtypes=standard_floats),
++            "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
++            "weight_scale": ParamConstraint(dtypes=standard_floats),
++            "bias": ParamConstraint(dtypes=standard_floats),
++            "convrot": ParamConstraint(dtypes=frozenset({bool})),
++            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
++        },
++        default_devices=all_devices,
++    )
+     float_param = ParamConstraint(dtypes=standard_floats)
+     int8_param = ParamConstraint(dtypes=frozenset({torch.int8}))
+     int_param = ParamConstraint(dtypes=frozenset({int}))
+diff --git a/comfy_kitchen/backends/eager/quantization.py b/comfy_kitchen/backends/eager/quantization.py
+index 7f81e9a..c8bc114 100644
+--- a/comfy_kitchen/backends/eager/quantization.py
++++ b/comfy_kitchen/backends/eager/quantization.py
+@@ -724,6 +724,7 @@ def _op_scaled_mm_mxfp8_fake(
+ 
+ 
+ _turing_device_cache: dict[int, bool] = {}
++_no_int8_tensor_core_cache: dict[int, bool] = {}
+ 
+ 
+ def _cuda_device_is_turing(device_index: int) -> bool:
+@@ -738,6 +739,25 @@ def _cuda_device_is_turing(device_index: int) -> bool:
+     return is_turing
+ 
+ 
++def _cuda_device_has_int8_tensor_core(device_index: int) -> bool:
++    """True when the device runs INT8 GEMMs on tensor cores (IMMA).
++
++    Volta (sm_70) has no INT8 tensor core: ``torch._int_mm`` falls back to a
++    DP4A-emulated INT8 GEMM whose throughput is below the device's FP16
++    tensor-core throughput, so an INT8 weight buys nothing but memory.
++    """
++    cached = _no_int8_tensor_core_cache.get(device_index)
++    if cached is not None:
++        return cached
++    try:
++        major, _minor = torch.cuda.get_device_capability(device_index)
++        has_int8 = major >= 8 or (major == 7 and _minor >= 5)
++    except RuntimeError:
++        has_int8 = False
++    _no_int8_tensor_core_cache[device_index] = has_int8
++    return has_int8
++
++
+ def _int8_mm_n_alignment(tensor: torch.Tensor) -> int:
+     # Turing cuBLASLt INT8 rejects some skinny-N shapes, e.g. N=17.
+     return 32 if tensor.is_cuda and _cuda_device_is_turing(tensor.get_device()) else 8
+@@ -982,6 +1002,109 @@ def fp16_linear(
+     return _apply_residual(out, residual, residual_scale)
+ 
+ 
++def int8_linear_fp16(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    out_dtype: torch.dtype = torch.bfloat16,
++    convrot: bool = False,
++    convrot_groupsize: int = 256,
++    input_act: str | None = None,
++    input_act_weight: torch.Tensor | None = None,
++    input_act_eps: float = 0.0,
++    residual: torch.Tensor | None = None,
++    residual_scale: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """INT8 linear layer that runs the GEMM on the FP16 tensor cores.
++
++    This is the fallback for devices without INT8 tensor cores (Volta/sm_70).
++    ``torch._int_mm`` there emulates INT8 with DP4A, which is *slower* than the
++    device's FP16 tensor cores, so keeping the weights in INT8 only costs
++    memory while making the GEMM slower.
++
++    The INT8 weights are dequantized to FP16 on the fly, exactly like the FP8
++    path already does, so the memory footprint stays that of the INT8 model.
++
++    For a ConvRot weight the stored matrix is ``W_rot = W @ H^T`` and the
++    activation is rotated online (``x_rot = x @ H``), so the GEMM runs entirely
++    in the rotated basis. That means the dequantized weight must **not** be
++    rotated back: dequantizing ``W_rot`` and multiplying by ``x_rot`` is
++    mathematically equivalent to the original basis, while rotating the weight
++    back would cost an extra Hadamard transform per layer.
++
++    The activation is still quantized to INT8 (same grid as the INT8 path), so
++    the numerics match the INT8 implementation; only the GEMM moves to FP16.
++
++    Args:
++        x: Input tensor [..., K].
++        weight: INT8 weight tensor [N, K].
++        weight_scale: Scalar or per-output-channel weight scale.
++        bias: Optional bias [N].
++        out_dtype: Output dtype.
++        convrot: If True, apply online activation rotation.
++        convrot_groupsize: Group size for Hadamard rotation.
++        input_act: Optional activation folded in before quantization.
++        input_act_weight: K-element weight for input_act "rms_norm".
++        input_act_eps: Eps for input_act "rms_norm".
++        residual: Optional [..., N] tensor; the result becomes
++            ``residual + residual_scale * linear(x)``.
++        residual_scale: Per-channel [N] scale for the residual form.
++
++    Returns:
++        Result tensor [..., N].
++    """
++    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
++    if x.shape[-1] != weight.shape[-1]:
++        raise ValueError(
++            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
++        )
++
++    weight = weight.to(device=x.device).contiguous()
++    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1)
++    if weight_scale.numel() not in (1, weight.shape[0]):
++        raise ValueError(
++            f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)} "
++            f"for weight shape {tuple(weight.shape)}"
++        )
++
++    if convrot:
++        if x.shape[-1] % convrot_groupsize != 0:
++            raise ValueError(
++                f"ConvRot group size {convrot_groupsize} does not divide input features {x.shape[-1]}"
++            )
++        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
++        x = _rotate_activation(x, h, convrot_groupsize)
++
++    orig_shape = x.shape
++    x_2d = x.reshape(-1, x.shape[-1])
++
++    # Same per-row activation quantization as the INT8 path, so the result
++    # stays on the INT8 quantization grid.
++    x_8, x_scale = quantize_int8_rowwise(x_2d)
++
++    compute_dtype = x.dtype
++    if compute_dtype not in (torch.float16, torch.bfloat16):
++        compute_dtype = torch.float16
++
++    # Dequantize both operands to FP16 and use the FP16 tensor cores.
++    # The weight stays in the rotated basis on purpose (see the docstring).
++    x_fp16 = x_8.to(compute_dtype) * x_scale.to(compute_dtype)
++    w_fp16 = weight.to(compute_dtype)
++    if weight_scale.numel() == weight.shape[0]:
++        w_fp16 = w_fp16 * weight_scale.reshape(-1, 1).to(compute_dtype)
++    else:
++        w_fp16 = w_fp16 * weight_scale.to(compute_dtype)
++
++    result = torch.matmul(x_fp16, w_fp16.t()).to(out_dtype)
++
++    if bias is not None:
++        result = result + bias.to(device=result.device, dtype=result.dtype).reshape(1, -1)
++
++    result = result.reshape(*orig_shape[:-1], weight.shape[0])
++    return _apply_residual(result, residual, residual_scale)
++
++
+ def int8_linear(
+     x: torch.Tensor,
+     weight: torch.Tensor,
+@@ -1001,6 +1124,11 @@ def int8_linear(
+     Quantizes x dynamically per-row, uses tensorwise weight scale.
+     Processes scaling in chunks to avoid materializing large float32 tensors.
+ 
++    On CUDA devices without INT8 tensor cores (Volta/sm_70) the INT8 GEMM is
++    DP4A-emulated and slower than the FP16 tensor cores, so this delegates to
++    :func:`int8_linear_fp16`, which keeps the INT8 weights in memory but runs
++    the GEMM in FP16.
++
+     Args:
+         x: Input tensor [..., K].
+         weight: INT8 weight tensor [N, K].
+@@ -1019,6 +1147,18 @@ def int8_linear(
+     Returns:
+         Result tensor [..., N].
+     """
++    if (
++        x.is_cuda
++        and weight.is_cuda
++        and not _cuda_device_has_int8_tensor_core(x.get_device())
++    ):
++        return int8_linear_fp16(
++            x, weight, weight_scale, bias, out_dtype,
++            convrot, convrot_groupsize,
++            input_act, input_act_weight, input_act_eps,
++            residual, residual_scale,
++        )
++
+     x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+     if x.shape[-1] != weight.shape[-1]:
+         raise ValueError(
+@@ -1320,3 +1460,46 @@ def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code,
+                          residual=None, residual_scale=None):
+     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
++
++
++@torch.library.custom_op("comfy_kitchen::int8_linear_fp16", mutates_args=())
++def _op_int8_linear_fp16(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++    convrot: bool = False,
++    convrot_groupsize: int = 256,
++    input_act: str | None = None,
++    input_act_weight: torch.Tensor | None = None,
++    input_act_eps: float = 0.0,
++    residual: torch.Tensor | None = None,
++    residual_scale: torch.Tensor | None = None,
++) -> torch.Tensor:
++    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
++    kwargs = {
++        "x": x,
++        "weight": weight,
++        "weight_scale": weight_scale,
++        "bias": bias,
++        "out_dtype": out_dtype,
++        "convrot": convrot,
++        "convrot_groupsize": convrot_groupsize,
++        "input_act": input_act,
++        "input_act_weight": input_act_weight,
++        "input_act_eps": input_act_eps,
++        "residual": residual,
++        "residual_scale": residual_scale,
++    }
++    impl = registry.get_implementation("int8_linear_fp16", kwargs=kwargs)
++    return impl(**kwargs)
++
++
++@_op_int8_linear_fp16.register_fake
++def _op_int8_linear_fp16_fake(x, weight, weight_scale, bias, output_dtype_code,
++                              convrot=False, convrot_groupsize=256, input_act=None,
++                              input_act_weight=None, input_act_eps=0.0,
++                              residual=None, residual_scale=None):
++    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
++    return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
+diff --git a/tests/test_int8_fp16_fallback.py b/tests/test_int8_fp16_fallback.py
+new file mode 100644
+index 0000000..27305bd
+--- /dev/null
++++ b/tests/test_int8_fp16_fallback.py
+@@ -0,0 +1,206 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Tests for the FP16-tensor-core INT8 fallback (``int8_linear_fp16``).
++
++Volta (sm_70) has no INT8 tensor core, so ``torch._int_mm`` emulates INT8 with
++DP4A and ends up slower than the device's FP16 tensor cores. The fallback
++dequantizes the INT8 weights to FP16 on the fly (memory footprint unchanged)
++and runs the GEMM on FP16, keeping the activation on the INT8 quantization grid
++so the numerics stay on par with the INT8 path.
++"""
++
++import pytest
++import torch
++
++import comfy_kitchen as ck
++from comfy_kitchen.backends.eager import quantization as eager_quant
++
++from .conftest import rel_err
++
++
++def _int8_tensorwise_weight(n: int, k: int, device, generator):
++    """Random INT8 weights plus a per-output-channel scale."""
++    weight = torch.randint(
++        -127, 128, (n, k), dtype=torch.int8, device=device, generator=generator
++    )
++    weight_scale = (
++        torch.rand(n, 1, device=device, generator=generator) * 0.02 + 0.001
++    ).to(torch.float32)
++    return weight, weight_scale
++
++
++def _reference_fp32(x, weight, weight_scale, convrot, group_size):
++    """Exact reference: un-rotate the weight, then a float32 matmul."""
++    w = weight.float()
++    if convrot:
++        from comfy_kitchen.tensor.int8_utils import _build_hadamard
++
++        h = _build_hadamard(group_size, device=x.device, dtype=torch.float32)
++        n_groups = w.shape[1] // group_size
++        w = torch.matmul(w.reshape(w.shape[0], n_groups, group_size), h).reshape(w.shape)
++    w = w * weight_scale.reshape(-1, 1).float()
++    return torch.matmul(x.float(), w.t())
++
++
++@pytest.mark.parametrize("convrot", [False, True])
++@pytest.mark.parametrize("group_size", [256])
++def test_int8_linear_fp16_matches_int8_path(convrot, group_size):
++    """The FP16 fallback must stay on the INT8 quantization grid.
++
++    Both paths quantize the activation to INT8 with the same grid, so their
++    results agree up to the accumulation precision of the two GEMMs.
++    """
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    generator = torch.Generator(device=device).manual_seed(0)
++
++    n, k, m = 512, 4096, 256
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    x = torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5
++
++    int8_out = eager_quant.int8_linear(
++        x, weight, weight_scale, out_dtype=torch.float16, convrot=convrot,
++        convrot_groupsize=group_size,
++    )
++    fp16_out = eager_quant.int8_linear_fp16(
++        x, weight, weight_scale, out_dtype=torch.float16, convrot=convrot,
++        convrot_groupsize=group_size,
++    )
++
++    assert fp16_out.shape == int8_out.shape
++    assert fp16_out.dtype == int8_out.dtype
++    # Same quantization grid -> the two agree to within the GEMM accumulation
++    # error. The INT8 path accumulates in int32 and scales afterwards, the FP16
++    # path accumulates in FP16, so a small drift is expected.
++    assert rel_err(fp16_out, int8_out) < 0.02
++
++
++@pytest.mark.parametrize("convrot", [False, True])
++def test_int8_linear_fp16_matches_float32_reference(convrot):
++    """The fallback must be no further from the float32 truth than INT8 is."""
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    generator = torch.Generator(device=device).manual_seed(1)
++
++    n, k, m = 512, 4096, 256
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    x = torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5
++
++    ref = _reference_fp32(x, weight, weight_scale, convrot, 256)
++    int8_out = eager_quant.int8_linear(
++        x, weight, weight_scale, out_dtype=torch.float32, convrot=convrot,
++    )
++    fp16_out = eager_quant.int8_linear_fp16(
++        x, weight, weight_scale, out_dtype=torch.float32, convrot=convrot,
++    )
++
++    int8_err = rel_err(int8_out, ref)
++    fp16_err = rel_err(fp16_out, ref)
++    # Both sit on the INT8 activation quantization grid, so their distance to
++    # the float32 reference is comparable; the fallback must not be worse.
++    assert fp16_err < int8_err * 1.5 + 1e-3
++
++
++def test_int8_linear_fp16_supports_bias_and_residual():
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    generator = torch.Generator(device=device).manual_seed(2)
++
++    n, k, m = 256, 4096, 128
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    x = torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5
++    bias = torch.randn(n, device=device, dtype=torch.float16, generator=generator)
++    residual = torch.randn(m, n, device=device, dtype=torch.float16, generator=generator)
++    residual_scale = torch.randn(n, device=device, dtype=torch.float16, generator=generator)
++
++    out = eager_quant.int8_linear_fp16(
++        x, weight, weight_scale, bias=bias, out_dtype=torch.float16,
++        residual=residual, residual_scale=residual_scale,
++    )
++    assert out.shape == (m, n)
++    assert torch.isfinite(out).all()
++
++
++def test_int8_linear_fp16_scalar_weight_scale():
++    """A scalar (per-tensor) weight scale must be accepted."""
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    generator = torch.Generator(device=device).manual_seed(3)
++
++    n, k, m = 128, 4096, 64
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    scalar_scale = weight_scale.mean().reshape(1)
++
++    out = eager_quant.int8_linear_fp16(
++        x := torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5,
++        weight, scalar_scale, out_dtype=torch.float16,
++    )
++    assert out.shape == (m, n)
++    assert x.shape == (m, k)
++
++
++def test_int8_linear_fp16_rejects_shape_mismatch():
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    generator = torch.Generator(device=device).manual_seed(4)
++
++    weight, weight_scale = _int8_tensorwise_weight(64, 4096, device, generator)
++    x = torch.randn(8, 2048, device=device, dtype=torch.float16, generator=generator)
++
++    with pytest.raises(ValueError, match="inner dimensions must match"):
++        eager_quant.int8_linear_fp16(x, weight, weight_scale, out_dtype=torch.float16)
++
++
++def test_int8_linear_fp16_is_registered_as_a_capability():
++    """The new entry point must be reachable through the public dispatch."""
++    backends = ck.list_backends()
++    assert "int8_linear_fp16" in backends["eager"]["capabilities"]
++
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    generator = torch.Generator(device=device).manual_seed(5)
++
++    n, k, m = 64, 4096, 32
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    x = torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5
++
++    out = ck.int8_linear_fp16(x, weight, weight_scale, out_dtype=torch.float16)
++    assert out.shape == (m, n)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_int8_linear_delegates_to_fp16_without_int8_tensor_core(monkeypatch):
++    """On a device without INT8 tensor cores, ``int8_linear`` takes the FP16 path."""
++    monkeypatch.setattr(
++        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: False
++    )
++
++    device = "cuda"
++    generator = torch.Generator(device=device).manual_seed(6)
++
++    n, k, m = 256, 4096, 128
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    x = torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5
++
++    delegated = eager_quant.int8_linear(x, weight, weight_scale, out_dtype=torch.float16)
++    direct = eager_quant.int8_linear_fp16(
++        x, weight, weight_scale, out_dtype=torch.float16
++    )
++    assert torch.equal(delegated, direct)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_int8_linear_keeps_int8_path_with_int8_tensor_core(monkeypatch):
++    """Devices that do have INT8 tensor cores keep the existing INT8 path."""
++    monkeypatch.setattr(
++        eager_quant, "_cuda_device_has_int8_tensor_core", lambda _index: True
++    )
++
++    device = "cuda"
++    generator = torch.Generator(device=device).manual_seed(7)
++
++    n, k, m = 256, 4096, 128
++    weight, weight_scale = _int8_tensorwise_weight(n, k, device, generator)
++    x = torch.randn(m, k, device=device, dtype=torch.float16, generator=generator) * 0.5
++
++    int8_out = eager_quant.int8_linear(x, weight, weight_scale, out_dtype=torch.float16)
++    fp16_out = eager_quant.int8_linear_fp16(
++        x, weight, weight_scale, out_dtype=torch.float16
++    )
++    # The INT8 path accumulates in int32, the FP16 path in FP16, so they differ
++    # slightly -- but the INT8 path must not be the FP16 one.
++    assert not torch.equal(int8_out, fp16_out)
