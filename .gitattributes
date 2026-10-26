@@ -1,0 +1,10 @@
+# 文本文件统一 LF；patch 文件禁止任何行尾转换，否则 git apply 会失败
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+
+# 补丁必须是逐字节原样，不能当成文本处理
+*.patch -text
+*.diff  -text
